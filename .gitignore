@@ -1,7 +1,0 @@
-STORAGE/
-STORAGE/LOGS/
-UI/
-.env
-*.log
-__pycache__/
-.DS_Store
