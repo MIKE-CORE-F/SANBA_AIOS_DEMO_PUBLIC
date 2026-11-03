@@ -1,0 +1,433 @@
+%%% @doc Identity, seed and realm resolution for the mesh pool
+%%% `mcl_om_sup' supervises alongside this gen_server.
+%%%
+%%% 11.x model (the PQ port): the service identity is a `macula_node_keys'
+%%% node key (purpose identity, pq_hybrid, puzzle-hardened at the fleet's
+%%% difficulty) — the same thing a station or pool identity is. The 10.x
+%%% Ed25519 keypair and the realm-signed service cert are gone with the
+%%% 11.x wire: realm membership is what the D25 authorization records and
+%%% the pool's `realm_trust' keys attest, not a TLS cert chain.
+%%%
+%%% Seeds must carry the station node ids they expect: the 11.x peering
+%%% layer refuses a client dial without an `expected_node_id' pin (D5).
+%%% `MACULA_STATION_SEEDS' (comma-separated hosts, ports default 4433)
+%%% pairs index-for-index with `MACULA_STATION_NODE_IDS' (comma-separated
+%%% 64-hex node ids); a seed without a matching pin is refused at boot —
+%%% a silent unpinned seed would be a dial that can never connect.
+%%%
+%%% Connect-degradation: with no seeds configured, `mcl_om_sup'
+%%% never starts a mesh pool child at all, and `macula_client/0'
+%%% returns `{error, no_client}' forever — consumers fall back to
+%%% no-op behaviour. The service stays up either way.
+%%%
+%%% UNLESS THE SERVICE SAYS THE MESH IS REQUIRED. `{mesh, required}' (the
+%%% mcl_service template sets it; the library default is `optional') means
+%%% the service exists to answer on the mesh, so booting it without its
+%%% realm, its realm key or its pinned seeds is refused, naming every
+%%% missing setting at once: `{mcl_om_mesh_unconfigured, #{missing =>
+%%% [<<"MCL_REALM">>, ...]}}'. A value relx expanded to nothing, or left
+%%% unexpanded, counts as missing. Whatever the mode, a realm that is set
+%%% but is neither 32 bytes nor 64 hex is refused by name.
+%%%
+%%% The pool itself is not this gen_server's state: it is an ordinary
+%%% supervised sibling (`mcl_om_sup', `restart => permanent'), started
+%%% strictly after this gen_server has loaded the key, so `identity_key/0'
+%%% is read back rather than re-loaded.
+-module(mcl_om_identity).
+-behaviour(gen_server).
+
+-export([start_link/0, macula_client/0, realm/0, identity_key/0, org/0, checked_org/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+%% Exported for mcl_om_identity_tests.erl — pure resolution logic.
+%% `base_pool_opts/0' is the composed map that reaches `macula:connect/2'.
+%% Under macula 12 what matters about it is what it does NOT carry: a
+%% `verify' entry is refused in any value, so composing one back in is a
+%% start-time failure rather than a silently different TLS policy.
+-export([node_key_from/1, realm_trust_opts/0, base_pool_opts/0]).
+%% Exported for mcl_om_sup.erl and as the mesh pool child's start function.
+-export([configured_seeds/0, start_mesh_pool/0]).
+
+-define(MESH_POOL_NAME, mcl_om_mesh_pool).
+
+-record(state, {
+    realm     :: binary() | undefined,  %% 32-byte realm tag
+    %% Stable service node key, loaded from `identity_key_path' at boot
+    %% and RETAINED so the service can sign its own DHT records
+    %% (procedure_advertisement). Undefined when the service runs on an
+    %% ephemeral SDK identity — such a service peers and calls fine but
+    %% cannot sign records, so it is (correctly) invisible to DHT
+    %% discovery.
+    key       :: macula_node_keys:node_key() | undefined,
+    org       :: binary()
+}).
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+%% @doc The mesh pool handle, or `{error, no_client}' when no seeds are
+%% configured (so `mcl_om_sup' never started the pool child at all).
+-spec macula_client() -> {ok, pid()} | {error, no_client}.
+macula_client() ->
+    case whereis(?MESH_POOL_NAME) of
+        Pid when is_pid(Pid) -> {ok, Pid};
+        undefined             -> {error, no_client}
+    end.
+
+%% @doc The 32-byte realm tag, `{error, no_realm}' when unset, or
+%% `{error, not_booted}' when called before this gen_server has started.
+-spec realm() -> {ok, <<_:256>>} | {error, no_realm | not_booted}.
+realm() ->
+    safe_call(realm).
+
+%% @doc The service's stable signing node key, `{error, no_identity_key}'
+%% when running on an ephemeral identity, or `{error, not_booted}' when
+%% called before this gen_server has started.
+-spec identity_key() -> {ok, macula_node_keys:node_key()} |
+                        {error, no_identity_key | not_booted}.
+identity_key() ->
+    safe_call(identity_key).
+
+%% @doc This service's org name (the `<org>' segment of its procedure
+%% URIs). Always a binary — `<<"_">>' both when unconfigured and when
+%% called before this gen_server has started.
+-spec org() -> binary().
+org() ->
+    case safe_call(org) of
+        {error, not_booted} -> <<"_">>;
+        Org                  -> Org
+    end.
+
+%% @doc Whether `Org' can be a service's org: a wire segment, the `Org' in
+%% `Org/Name'. Refused: `_' (what org/0 answers when none is configured),
+%% empty, an environment variable relx left unexpanded ("${MCL_ORG}"), and
+%% anything else a procedure name cannot start with. mcl_om:boot/2 refuses to
+%% boot a service on the refusal.
+-spec checked_org(binary()) -> ok | {error, {not_an_org, binary()}}.
+checked_org(Org) when is_binary(Org) ->
+    org_shape(re:run(Org, <<"^[a-z0-9][a-z0-9._-]*$">>, [{capture, none}]), Org).
+
+org_shape(match, _Org) -> ok;
+org_shape(nomatch, Org) -> {error, {not_an_org, Org}}.
+
+safe_call(Msg) ->
+    try gen_server:call(?MODULE, Msg)
+    catch exit:{noproc, _} -> {error, not_booted}
+    end.
+
+init([]) ->
+    init_checked(mesh_verdict(application:get_env(mcl_om, mesh, optional),
+                              configured_realm())).
+
+%% Checked before the node key: a refused boot should not first grind a
+%% puzzle-hardened key and persist it.
+init_checked(ok) ->
+    init_with_key(load_node_key());
+init_checked({error, Reason}) ->
+    {stop, Reason}.
+
+init_with_key({error, Reason}) ->
+    {stop, Reason};
+init_with_key(Key) ->
+    {ok, #state{realm = load_realm(),
+                key = Key,
+                org = load_org()}}.
+
+handle_call(realm, _From, #state{realm = undefined} = S) ->
+    {reply, {error, no_realm}, S};
+handle_call(realm, _From, #state{realm = R} = S) ->
+    {reply, {ok, R}, S};
+
+handle_call(identity_key, _From, #state{key = undefined} = S) ->
+    {reply, {error, no_identity_key}, S};
+handle_call(identity_key, _From, #state{key = K} = S) ->
+    {reply, {ok, K}, S};
+
+handle_call(org, _From, #state{org = Org} = S) ->
+    {reply, Org, S};
+
+handle_call(_Msg, _From, S) ->
+    {reply, {error, unknown_call}, S}.
+
+handle_cast(_Msg, S) -> {noreply, S}.
+
+handle_info(_Msg, S) ->
+    {noreply, S}.
+
+terminate(_Reason, _State) -> ok.
+
+%%% Internals
+
+%% Realm tag = 32-byte binary, read from env (the operator pins it in
+%% the service's deploy env), hex or raw. Runs after init/1 has refused a
+%% malformed one, so only the two good shapes reach it.
+load_realm() ->
+    {ok, Realm} = configured_realm(),
+    Realm.
+
+configured_realm() ->
+    realm_from(application:get_env(mcl_om, realm)).
+
+realm_from(undefined) ->
+    {ok, undefined};
+realm_from({ok, R}) when is_binary(R) ->
+    realm_value(unset(R), R);
+realm_from({ok, Other}) ->
+    %% Named by its type only: whatever was configured stays out of logs.
+    {error, {mcl_om_realm_malformed,
+             #{setting => <<"MCL_REALM">>, type => type_of(Other)}}}.
+
+type_of(T) when is_list(T)    -> list;
+type_of(T) when is_atom(T)    -> atom;
+type_of(T) when is_integer(T) -> integer;
+type_of(T) when is_tuple(T)   -> tuple;
+type_of(T) when is_map(T)     -> map;
+type_of(_)                    -> other.
+
+realm_value(true, _R) ->
+    {ok, undefined};
+realm_value(false, <<_:256>> = R) ->
+    {ok, R};
+realm_value(false, R) ->
+    realm_hex(byte_size(R) =:= 64 andalso hex_shaped(R), R).
+
+realm_hex(true, Hex) ->
+    {ok, decode_hex(Hex)};
+realm_hex(false, R) ->
+    {error, {mcl_om_realm_malformed,
+             #{setting => <<"MCL_REALM">>, bytes => byte_size(R)}}}.
+
+%% What relx leaves of a variable that was not set: nothing when it
+%% expanded it, the reference itself when it did not.
+unset(<<>>) -> true;
+unset(<<"${", _/binary>>) -> true;
+unset(_) -> false.
+
+mesh_verdict(_Mesh, {error, _} = Malformed) ->
+    Malformed;
+mesh_verdict(optional, {ok, _Realm}) ->
+    ok;
+mesh_verdict(required, {ok, Realm}) ->
+    missing_verdict([Setting || {Setting, false} <- mesh_settings(Realm)]);
+mesh_verdict(Other, {ok, _Realm}) ->
+    {error, {mcl_om_mesh_setting_unknown, Other}}.
+
+mesh_settings(Realm) ->
+    [{<<"MCL_REALM">>, Realm =/= undefined},
+     {<<"MCL_REALM_KEY">>, configured_realm_key() =/= undefined}
+     | seed_settings(app_env_seeds())].
+
+%% `station_seeds' in the app env carry their own pins; otherwise both
+%% environment variables are needed.
+seed_settings([_ | _]) ->
+    [];
+seed_settings([]) ->
+    [{<<"MACULA_STATION_SEEDS">>, env_set("MACULA_STATION_SEEDS")},
+     {<<"MACULA_STATION_NODE_IDS">>, env_set("MACULA_STATION_NODE_IDS")}].
+
+env_set(Var) ->
+    parse_csv(os:getenv(Var)) =/= [].
+
+missing_verdict([]) ->
+    ok;
+missing_verdict(Missing) ->
+    {error, {mcl_om_mesh_unconfigured, #{missing => Missing}}}.
+
+%% Start function for the mesh-pool child `mcl_om_sup' includes whenever
+%% pinned seeds are configured. Runs strictly after this gen_server, so
+%% the node key is already resolved.
+-spec start_mesh_pool() -> {ok, pid()} | {error, term()}.
+start_mesh_pool() ->
+    NodeKey = case identity_key() of
+        {ok, K}   -> K;
+        {error, _} -> undefined
+    end,
+    case macula:connect(configured_seeds(), pool_opts(NodeKey)) of
+        {ok, Pid} ->
+            true = erlang:register(?MESH_POOL_NAME, Pid),
+            {ok, Pid};
+        {error, _Reason} = Err ->
+            Err
+    end.
+
+%% The 11.x pool: the node identity (generated by the SDK when absent —
+%% puzzle-hardened at the configured difficulty), the pinned seeds, and
+%% the realm trust keys the pool verifies org-namespaced advertisements
+%% against (D25/D28). `realm_trust' comes from the deploy env; the pool
+%% refuses to start with a trust entry whose id/key is malformed.
+pool_opts(undefined) ->
+    base_pool_opts();
+pool_opts(NodeKey) ->
+    maps:merge(base_pool_opts(), #{node_identity => NodeKey}).
+
+base_pool_opts() ->
+    realm_trust_opts().
+
+%% The realm key the pool pins for org-namespaced advertisement
+%% verification (D25): `#{RealmId => RealmKey}', the realm's public
+%% signing key as carried, built from the `realm' and `realm_key' deploy
+%% envs. One realm per service, matching one org per service.
+%%
+%% ⚠ REQUIRED, AND LOUD WHEN ABSENT. This used to fall through to `#{}'
+%% when nothing was configured. That is how a service reached a box, went
+%% green, answered /health, and was PERMANENTLY unable to resolve anything
+%% org-namespaced: with no realm key
+%% `macula_record:verify_authorization/3' refuses every advertisement with
+%% `no_realm_key', `macula_direct_dial' reports `{unresolved,
+%% no_trusted_advertisement}', and the boot claim never reaches the realm,
+%% so there is no pending row for an operator to approve, no delegation,
+%% and no advertise. An unconfigured trust anchor is not a deployment that
+%% half works; it is one that cannot work, and it should not boot.
+%%
+%% THE HEX DECODE LIVES HERE, not in the SDK and not in a service.
+%% `macula:connect/2' takes `realm_trust' as raw bytes and deliberately
+%% refuses anything else: it is a typed, in-memory contract. A deploy
+%% environment can only carry text. Translating one into the other is
+%% exactly what this module already does for `realm' (64-hex to 32 bytes)
+%% and for every seed's `expected_node_id'. Anywhere else means every
+%% mcl-* service doing it again, which is the duplication that produced
+%% the outage this clause exists to prevent.
+%%
+%% A malformed entry would also be refused by macula:connect/2 itself
+%% (`{error, {realm_trust, invalid}}'), but by then the reason is about a
+%% map the operator never typed. The checks here name the variable.
+realm_trust_opts() ->
+    #{realm_trust => realm_trust(load_realm(), configured_realm_key())}.
+
+realm_trust(undefined, _KeyHex) ->
+    error({mcl_om_realm_trust, realm_unconfigured});
+realm_trust(_Realm, undefined) ->
+    error({mcl_om_realm_trust, realm_key_unconfigured});
+realm_trust(<<_:256>> = Realm, KeyHex) ->
+    #{Realm => realm_key_decoded(hex_shaped(KeyHex), KeyHex)}.
+
+configured_realm_key() ->
+    realm_key_from(application:get_env(mcl_om, realm_key)).
+
+realm_key_from({ok, Hex}) when is_binary(Hex) ->
+    realm_key_value(unset(Hex), Hex);
+realm_key_from(undefined) ->
+    undefined.
+
+realm_key_value(true, _Hex) -> undefined;
+realm_key_value(false, Hex) -> Hex.
+
+%% Checked before decoding rather than after: decode_hex/1 on a stray
+%% character raises a bare badarg naming nothing.
+realm_key_decoded(true, KeyHex) ->
+    decode_hex(KeyHex);
+realm_key_decoded(false, KeyHex) ->
+    error({mcl_om_realm_trust, {realm_key_not_hex, byte_size(KeyHex)}}).
+
+hex_shaped(Hex) ->
+    byte_size(Hex) rem 2 =:= 0 andalso
+        match =:= re:run(Hex, <<"^[0-9a-fA-F]+$">>, [{capture, none}]).
+
+%% Load the stable on-disk service node key when `identity_key_path' is
+%% configured; `undefined' only when the path itself is unconfigured, and
+%% then the pool connects on macula's own stored identity for the machine.
+%% First boot needs no out-of-band provisioning: a MISSING key file
+%% generates a fresh key and persists it, and a key that cannot be
+%% persisted stops the service. Any OTHER load failure stops the service
+%% and leaves the file untouched — generating a replacement would silently
+%% change the service's node id.
+load_node_key() ->
+    node_key_from(application:get_env(mcl_om, identity_key_path)).
+
+-spec node_key_from({ok, file:filename_all()} | undefined) ->
+    macula_node_keys:node_key() | undefined |
+    {error, {identity_key_unloadable, file:filename_all(), term()}} |
+    {error, {identity_key_unsaveable, file:filename_all(), term()}}.
+node_key_from(undefined) ->
+    undefined;
+node_key_from({ok, Path}) ->
+    loaded_or_generated(macula_node_keys:load(Path, identity, profile()),
+                        Path).
+
+profile() ->
+    {ok, P} = macula_crypto_profile:configured(),
+    P.
+
+loaded_or_generated({ok, K}, _Path) ->
+    K;
+loaded_or_generated({error, enoent}, Path) ->
+    generate_and_save(Path);
+loaded_or_generated({error, Reason}, Path) ->
+    {error, {identity_key_unloadable, Path, Reason}}.
+
+%% Puzzle-hardened at the fleet's difficulty: every PQ station enforces
+%% the puzzle on the CONNECT/HELLO handshake, and an unhardened identity
+%% is closed as puzzle_invalid on every connection, forever.
+generate_and_save(Path) ->
+    {ok, Key} = macula_node_keys:generate(
+                  identity, profile(),
+                  #{puzzle_difficulty => macula_node_keys:puzzle_difficulty()}),
+    save_result(macula_node_keys:save(Path, Key), Key, Path).
+
+%% A key that cannot be saved stops the service rather than running it on
+%% a throwaway identity: the next start would generate another, so the
+%% node id would change on every restart with nothing reporting it.
+save_result(ok, Key, _Path) -> Key;
+save_result({error, Reason}, _Key, Path) ->
+    {error, {identity_key_unsaveable, Path, Reason}}.
+
+%% Org name from the `org' app env; `<<"_">>' when unset.
+load_org() ->
+    case application:get_env(mcl_om, org) of
+        {ok, O} when is_binary(O), O =/= <<>> -> O;
+        _                                     -> <<"_">>
+    end.
+
+%% Station seeds, in precedence order:
+%%   1. MACULA_STATION_SEEDS env var (comma-separated hosts) paired with
+%%      MACULA_STATION_NODE_IDS (comma-separated 64-hex node ids) by
+%%      index — the 11.x pin every dial needs. A seed without a matching
+%%      pin is refused: an unpinned dial can never connect (D5).
+%%   2. `station_seeds' app env: [#{host, port, expected_node_id}].
+configured_seeds() ->
+    case pinned_env_seeds() of
+        []    -> app_env_seeds();
+        Seeds -> Seeds
+    end.
+
+pinned_env_seeds() ->
+    Hosts = parse_csv(os:getenv("MACULA_STATION_SEEDS")),
+    Ids   = parse_csv(os:getenv("MACULA_STATION_NODE_IDS")),
+    pair_seeds(Hosts, Ids, []).
+
+pair_seeds([], [], Acc) ->
+    lists:reverse(Acc);
+pair_seeds([Host | Hosts], [IdHex | Ids], Acc) ->
+    {HostName, Port} = split_host(Host),
+    pair_seeds(Hosts, Ids,
+               [#{host => HostName, port => Port,
+                  expected_node_id => decode_hex(IdHex)} | Acc]);
+pair_seeds([], _Ids, _Acc) ->
+    %% Ids without hosts: configuration error, loud.
+    error({mcl_om, node_ids_without_seeds});
+pair_seeds(_Hosts, [], _Acc) ->
+    %% Seeds without pins: each is a dial that can never connect — refuse
+    %% the whole list rather than boot a pool that holds dead seeds.
+    error({mcl_om, seeds_without_node_ids}).
+
+split_host(HostBin) ->
+    case binary:split(HostBin, <<":">>) of
+        [Host]           -> {Host, 4433};
+        [Host, PortBin]  -> {Host, binary_to_integer(PortBin)};
+        _                -> {HostBin, 4433}
+    end.
+
+app_env_seeds() ->
+    case application:get_env(mcl_om, station_seeds) of
+        {ok, Seeds} when is_list(Seeds) -> Seeds;
+        _                                -> []
+    end.
+
+parse_csv(false) -> [];
+parse_csv(Csv) ->
+    [list_to_binary(Trimmed)
+     || Part <- string:split(Csv, ",", all),
+        Trimmed <- [string:trim(Part)],
+        Trimmed =/= ""].
+
+decode_hex(Hex) ->
+    << <<(list_to_integer([A,B], 16))>> || <<A:8, B:8>> <= Hex >>.

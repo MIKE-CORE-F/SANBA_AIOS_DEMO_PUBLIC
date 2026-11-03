@@ -1,0 +1,273 @@
+%%% @doc Public facade for mcl_om — the PQ-only over-mesh substrate.
+%%%
+%%% Services typically only need a handful of these:
+%%%
+%%%   mcl_om:boot(MyServiceMod)         %% one-call lifecycle wiring
+%%%   mcl_om:advertise_capabilities()   %% (re-)publish my caps
+%%%   mcl_om:health()                   %% snapshot for /health
+%%%   mcl_om:identity_key()             %% my node key, or {error, ...}
+%%%   mcl_om:macula_client()            %% returns the SDK client handle
+-module(mcl_om).
+
+-export([
+    boot/1,
+    boot/2,
+    advertise_capabilities/0,
+    call_capability/4,
+    call_capability/5,    health/0,
+    macula_client/0,
+    realm/0,
+    identity_key/0,
+    mesh_handles/0,
+    org_member/2,
+    service_module/0,
+    leftover_store_callbacks/1,
+    warn_leftover_store/1
+]).
+
+%% The store callbacks of the contract before 0.35.0, in the order it listed them.
+-define(OLD_STORE_CALLBACKS, [store_id, data_dir, store_indexes, store_mode, store_integrity]).
+
+-define(SERVICE_MODULE_KEY, mcl_om_service_module).
+
+%% @doc Wire a service module into mcl_om and start it.
+%%
+%% Typical call from the hosting service's `_app:start/2':
+%%
+%%   start(_, _) ->
+%%       mcl_om:boot(my_service).
+-spec boot(module()) -> {ok, pid()} | {error, term()}.
+boot(ServiceMod) ->
+    boot(ServiceMod, #{}).
+
+-spec boot(module(), map()) -> {ok, pid()} | {error, term()}.
+boot(ServiceMod, Opts) when is_atom(ServiceMod), is_map(Opts) ->
+    persistent_term:put(?SERVICE_MODULE_KEY, ServiceMod),
+    ok = org_configured(mcl_om_identity:org()),
+    ok = info_names_no_health_key(ServiceMod),
+    _ = warn_leftover_store(ServiceMod),
+    ok = mcl_om_health:register(ServiceMod),
+    %% ADVERTISE ONLY AFTER A SUCCESSFUL START. A procedure is announced
+    %% only once the service can answer it, and a service that refuses to
+    %% start leaves no advertisement behind. ServiceMod:start/1 is where
+    %% the processes its handlers call come up, so capabilities and
+    %% subscriptions are registered only once it has returned {ok, Pid}.
+    %% (Health registers before start, deliberately: the /health listener
+    %% must answer during boot, and health() reports the half-up tree
+    %% honestly.)
+    case ServiceMod:start(Opts) of
+        {ok, Pid} ->
+            ok = mcl_om_capabilities:register(capabilities_with_describe(ServiceMod)),
+            ok = maybe_wire_subscriptions(ServiceMod),
+            {ok, Pid};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @private ServiceMod's own declared capabilities, plus a synthetic
+%% `<service-name>.describe_capabilities' one when it exports either
+%% `describe_rpc_capabilities/0' or `describe_pubsub_capabilities/0'
+%% (see mcl_om_describe:capability_for/2) -- omitted entirely for a
+%% service that exports neither, same "optional means genuinely absent,
+%% not present-but-empty" contract every other optional callback here
+%% already has.
+capabilities_with_describe(ServiceMod) ->
+    #{name := ServiceName} = ServiceMod:info(),
+    Caps = ServiceMod:capabilities(),
+    mcl_om_guard_control:with_caps(
+      mcl_om_info:with_info(
+        add_describe_capability(mcl_om_describe:capability_for(ServiceMod, ServiceName), Caps))).
+
+add_describe_capability(undefined, Caps)     -> Caps;
+add_describe_capability(DescribeCap, Caps)   -> [DescribeCap | Caps].
+
+%% @private A service without an org offers nothing: every procedure is
+%% `Org/Name', and the realm grants per org. It used to boot anyway, log
+%% "advertise skipped, no org configured" and run green without ever
+%% advertising or claiming. It refuses to boot now, naming the setting.
+org_configured(Org) ->
+    org_verdict(mcl_om_identity:checked_org(Org), Org).
+
+org_verdict(ok, _Org) ->
+    ok;
+org_verdict({error, _}, Org) ->
+    error({mcl_om_org_not_configured,
+           #{got => Org,
+             setting => <<"the mcl_om `org' app env, e.g. {org, <<\"${MCL_ORG}\">>} in "
+                          "sys.config with MCL_ORG set, or the repository name as a literal">>}}).
+
+%% @private The keys `/health' sets itself, as the body's JSON spells
+%% them. `mcl_om_health_handler:body/6' merges the service's info() into
+%% its own map with ATOM keys, so a service key of the same name in binary
+%% form survives the merge as a second JSON key beside the library's and
+%% a reader that keeps the last one silently replaces the verdict
+%% (mcl-om#36, Mars's R2). Refused at boot rather than dropped: a service
+%% that thought it was reporting `status' has a bug, and answering 200
+%% with the library's status instead hides it.
+-define(HEALTH_BODY_KEYS, [<<"status">>, <<"provider_grants">>, <<"advertise_liveness">>,
+                           <<"claim">>, <<"failed_publishes">>]).
+
+info_names_no_health_key(ServiceMod) ->
+    Keys = [key_text(Key) || Key <- maps:keys(ServiceMod:info())],
+    case lists:sort([Key || Key <- Keys, lists:member(Key, ?HEALTH_BODY_KEYS)]) of
+        [] ->
+            ok;
+        Shadowed ->
+            error({mcl_om_info_key_is_a_health_key,
+                   #{keys => Shadowed,
+                     setting => <<"rename the key: /health sets these itself, and a "
+                                  "second key of the same name lets a reader replace "
+                                  "the verdict">>}})
+    end.
+
+key_text(Key) when is_atom(Key)   -> atom_to_binary(Key, utf8);
+key_text(Key) when is_binary(Key) -> Key.
+
+%% @private When the service module exports subscriptions/0, wire each
+%% declared {Topic, HandlerMod, Args} into a supervised macula_subscriber
+%% before the service's own start/1 runs. Producer-only / consumer-only
+%% services that omit the callback pay nothing.
+maybe_wire_subscriptions(ServiceMod) ->
+    _ = code:ensure_loaded(ServiceMod),
+    Has = erlang:function_exported(ServiceMod, subscriptions, 0),
+    wire_subscriptions(Has, ServiceMod).
+
+wire_subscriptions(false, _ServiceMod) ->
+    ok;
+wire_subscriptions(true, ServiceMod) ->
+    mcl_om_pubsub:ensure_subscriptions(ServiceMod:subscriptions()).
+
+%% @doc The store callbacks `ServiceMod' still exports from the contract before
+%% 0.35.0, when `boot/1' opened a reckon-db store for a service exporting
+%% `store_id/0' and `data_dir/0'. It does not any more (mcl-om#10): each
+%% service chooses its own persistence and opens its own store.
+%%
+%% Only the old contract's ACTIVATION counts, `store_id/0' and `data_dir/0'
+%% together, which is what made 0.34 open a store: a storeless service with a
+%% `data_dir/0' of its own never had one. Then every old store callback it still
+%% exports is named.
+-spec leftover_store_callbacks(module()) -> [atom()].
+leftover_store_callbacks(ServiceMod) ->
+    _ = code:ensure_loaded(ServiceMod),
+    Exported = [F || F <- ?OLD_STORE_CALLBACKS, erlang:function_exported(ServiceMod, F, 0)],
+    activated(lists:member(store_id, Exported) andalso lists:member(data_dir, Exported), Exported).
+
+activated(true, Exported) -> Exported;
+activated(false, _Exported) -> [].
+
+%% @doc A service built for the old contract boots WITHOUT the store it expects,
+%% and would fail later, where nobody connects it to this release. So boot says
+%% so at once, as a warning naming the callbacks and the way out.
+-spec warn_leftover_store(module()) -> ok | {warned, [atom()]}.
+warn_leftover_store(ServiceMod) ->
+    warned(leftover_store_callbacks(ServiceMod), ServiceMod).
+
+warned([], _ServiceMod) ->
+    ok;
+warned(Callbacks, ServiceMod) ->
+    logger:warning(#{what => mcl_om_no_longer_opens_a_store,
+                     service => ServiceMod,
+                     callbacks => Callbacks,
+                     instead => <<"mcl_om 0.35.0 opens no store and starts no reckon_db, evoq or "
+                                  "reckon_evoq. Declare those three in the service's own deps and "
+                                  "applications, open the store in the application's own start/2 "
+                                  "before mcl_om:boot/1, and stop exporting store_id/0 and "
+                                  "data_dir/0 from the service module: `rebar3 new mcl_service "
+                                  "store=1' generates that wiring in <name>_app. See mcl_om's "
+                                  "CHANGELOG, 0.35.0.">>}),
+    {warned, Callbacks}.
+
+-spec service_module() -> module() | undefined.
+service_module() ->
+    persistent_term:get(?SERVICE_MODULE_KEY, undefined).
+
+%% @doc (Re-)publish this service's capabilities onto the mesh.
+%% Typically called once at boot; call again when the capability
+%% set changes.
+-spec advertise_capabilities() -> ok.
+advertise_capabilities() ->
+    mcl_om_capabilities:publish().
+
+%% @doc Call a capability by name over the direct-dial data path:
+%% resolve a provider from the DHT, dial its serving station directly,
+%% and issue the CALL there (failing over to the next provider on
+%% error). The CALL uses `CapName' as the procedure, realm-scoped.
+-spec call_capability(binary(), binary(), term(), pos_integer()) ->
+    {ok, term()} | {error, term()}.
+call_capability(Org, CapName, Payload, TimeoutMs) ->
+    mcl_om_capabilities:call_capability(Org, CapName, Payload, TimeoutMs, #{}).
+
+%% @doc As call_capability/4, with `Opts'. One caller-facing option so
+%% far, and it is the one the many-provider contract model needs:
+%%
+%%   advertiser => `<<_:256>>'   call ONLY the provider whose signed
+%%       advertisement was published by this node id. One org procedure
+%%       with many providers -- a thousand book clubs, one
+%%       `get_bookclub_by_id' -- resolves to whoever the DHT lists first;
+%%       a club that does not own the asked id answers `not_found', which
+%%       is a valid answer and NOT a failover signal, so the wrong club
+%%       wins by order. The fix is not a smarter retry, it is a pin: the
+%%       caller that holds the club's node id (the publisher of the facts
+%%       it consumed) names it here, and only that club is dialed. An
+%%       absent or stale pin resolves to nothing and fails closed with
+%%       `{error, no_provider}'.
+%%
+%% `{error, no_provider}' means exactly "nothing was dialed": nothing
+%% resolved, or the pin matched no resolved provider. A provider that
+%% WAS dialed reports its own failure instead (`{error, timeout}',
+%% `{error, {station_endpoint, Reason}}', ...), so a dead provider and
+%% a stale pin are never the same answer (0.29.0).
+-spec call_capability(binary(), binary(), term(), pos_integer(), map()) ->
+    {ok, term()} | {error, term()}.
+call_capability(Org, CapName, Payload, TimeoutMs, Opts) ->
+    mcl_om_capabilities:call_capability(Org, CapName, Payload, TimeoutMs, Opts).
+
+%% @doc Snapshot of this service's health. Used by /health handler.
+-spec health() -> mcl_om_service:health().
+health() ->
+    mcl_om_health:snapshot().
+
+-spec macula_client() -> {ok, term()} | {error, term()}.
+macula_client() ->
+    mcl_om_identity:macula_client().
+
+%% @doc This service's realm tag (32-byte binary). Previously reachable
+%% only by calling `mcl_om_identity:realm/0' directly, past the public
+%% facade -- every service wanting to publish/subscribe/advertise on the
+%% mesh needs this alongside `macula_client/0', so it belongs here.
+-spec realm() -> {ok, binary()} | {error, term()}.
+realm() ->
+    mcl_om_identity:realm().
+
+%% @doc This service's stable signing node key, or
+%% `{error, no_identity_key}' when running on an ephemeral identity.
+%% Needed by every provider advertisement, which signs its own DHT
+%% record with it.
+-spec identity_key() -> {ok, macula_node_keys:node_key()} | {error, term()}.
+identity_key() ->
+    mcl_om_identity:identity_key().
+
+%% @doc The `{Pool, Realm}' pair every PubSub/RPC-consumer/Content call
+%% needs together. Replaces the hand-rolled
+%% `case {macula_client(), realm()} of {{ok,P},{ok,R}} -> ...' pairing
+%% four independent service repos each wrote for themselves (among
+%% them `tom_ocean_mesh.erl', `tom_wire_macula.erl', `tom_crier.erl')
+%% because mcl_om gave them nothing to build on.
+%% Degrades to `{error, mesh_unavailable}' rather than crashing when
+%% either half is missing (mesh unreachable, or no client attached yet).
+-spec mesh_handles() -> {ok, term(), binary()} | {error, mesh_unavailable}.
+mesh_handles() ->
+    handles(macula_client(), realm()).
+
+handles({ok, Pool}, {ok, Realm}) -> {ok, Pool, Realm};
+handles(_MaculaClient, _Realm) -> {error, mesh_unavailable}.
+
+%% @doc Whether `NodeId' is an admitted member of `Org' in this service's realm,
+%% cached (`mcl_om_org_member'). macula verifies who signed a publication, not
+%% who may publish on a topic: a subscriber that must hear only an org's own
+%% nodes asks this about the delivery's `publisher'. `{error, {not_a_member,
+%% _}}' is the realm's refusal; `{error, {unavailable, _}}' means it could not
+%% find out, and is not a refusal.
+-spec org_member(binary(), <<_:256>>) -> mcl_om_org_member:answer().
+org_member(Org, NodeId) ->
+    mcl_om_org_member:org_member(Org, NodeId).

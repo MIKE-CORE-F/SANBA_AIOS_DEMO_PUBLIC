@@ -1,0 +1,60 @@
+{application, mcl_om, [
+    {description, "PQ-only over-mesh substrate for the macula-services/mcl-* daemons"},
+    {vsn, "1.5.0"},
+    {registered, [mcl_om_sup]},
+    {mod, {mcl_om_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        crypto,
+        cowboy,
+        jsx,
+        macula
+    ]},
+    {env, [
+        %% `required' (the mcl_service template sets it): refuse to boot
+        %% without the realm, the realm key and pinned station seeds,
+        %% naming every one missing. `optional': run without a mesh when
+        %% no seeds are configured. See mcl_om_identity.
+        {mesh, optional},
+
+        %% Service-principal cert path, inside the service's identity
+        %% volume, which the deploy mounts at /etc/mcl/secrets.
+        {service_cert_path, "/etc/mcl/secrets/service-cert.pem"},
+
+        %% Realm tag (32-byte binary). Operator pins this via the
+        %% per-service env file in macula-fleet. May also be supplied
+        %% as a 64-char hex binary. v2 will extract from the
+        %% service-principal cert instead.
+        %% {realm, <<...32 bytes...>>}
+
+        %% Station seeds the service dials over QUIC. Each seed is a
+        %% binary URL ("quic://host:port"), a string, or a map
+        %% (#{host=>..., port=>...}). Empty list = run offline (the
+        %% service stays up but can't reach the mesh).
+        %%
+        %% Precedence: the MACULA_STATION_SEEDS env var (comma-separated
+        %% URLs) overrides this list when set — lets one deployed image
+        %% dial a distinct station per instance without a rebuild. See
+        %% mcl_om_identity:configured_seeds/0.
+        {station_seeds, []},
+
+        %% Health endpoint (GET /health). `health_socket', a path such as
+        %% "/run/mcl/health.sock", serves it on a Unix socket and opens no TCP
+        %% listener; unset, `health_port' is the fallback.
+        {health_socket,     undefined},
+        {health_port,       8470},
+
+        %% Address the health listener binds: a string such as "127.0.0.1" or
+        %% an address tuple. undefined (or empty) binds every interface.
+        {health_ip,         undefined},
+
+        %% Prefix for capability advertisements on the mesh bloom channel.
+        {capability_topic,  <<"_mesh.cap.">>}
+    ]},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [
+        {"GitHub", "https://github.com/macula-services/mcl-om"}
+    ]}
+]}.
